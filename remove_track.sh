@@ -14,7 +14,7 @@
 # 3. Execute the script: `./remove_track.sh`
 # 4. Follow the prompts to remove tracks as needed.
 #
-# Author: [Your Name]
+# Author: ellite
 # License: MIT
 
 # Loop through all MKV files in the current directory
