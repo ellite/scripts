@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+
+"""
+cleansubtitlles: Remove style and formatting tags from subtitle files.
+
+This script scans the current directory for all .srt, .ass, and .ssa subtitle files.
+It allows you to select which files to clean (or press Enter to clean all).
+For each selected file, it removes:
+- ASS/SSA style tags like {\an3}, {\b1}, etc.
+- Any curly-brace tags { ... }
+- HTML-like tags such as <font ...>, </font>, <b>, </b>, etc.
+
+The cleaned subtitles overwrite the original files.
+
+Usage:
+    python3 cleansubtitlles
+    # Follow the prompt to select which subtitle files to clean.
+
+This is useful for stripping out formatting/styles for compatibility or readability.
+"""
+
+import os
+import sys
+import re
+from pathlib import Path
+
+def clean_subtitle_line(line):
+    # Remove style tags like {\an3}, {\b1}, etc.
+    line = re.sub(r'\{\\.*?\}', '', line)
+    # Remove any remaining curly-brace tags
+    line = re.sub(r'\{.*?\}', '', line)
+    # Remove HTML-like tags such as <font ...>, </font>, <b>, </b>, etc.
+    line = re.sub(r'<[^>]+>', '', line)
+    return line.strip()
+
+def clean_subtitle_file(input_path, output_path=None):
+    with open(input_path, 'r', encoding='utf-8') as infile:
+        lines = infile.readlines()
+    cleaned_lines = [clean_subtitle_line(line) for line in lines]
+    if output_path is None:
+        output_path = input_path
+    with open(output_path, 'w', encoding='utf-8') as outfile:
+        for line in cleaned_lines:
+            outfile.write(line + '\n')
+
+def list_subtitle_files():
+    exts = ('.srt', '.ass', '.ssa')
+    files = [f for f in sorted(os.listdir()) if f.lower().endswith(exts)]
+    for idx, file in enumerate(files, 1):
+        print(f"{idx}: {file}")
+    return files
+
+def get_user_selection(files):
+    selection = input("Enter numbers of subtitle files to clean (comma-separated), or press Enter for all: ").strip()
+    if not selection:
+        return files
+    indices = [int(i) - 1 for i in selection.split(",") if i.strip().isdigit() and 0 < int(i) <= len(files)]
+    return [files[i] for i in indices]
+
+def main():
+    files = list_subtitle_files()
+    if not files:
+        print("No subtitle files found in this folder.")
+        sys.exit(0)
+    selected_files = get_user_selection(files)
+    for file in selected_files:
+        clean_subtitle_file(file)
+        print(f"Cleaned: {file}")
+
+if __name__ == "__main__":
+    main()
