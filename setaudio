@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+
+"""
+setaudio: Batch set the audio language tag for MKV and MP4 files in a folder.
+
+This script lists all .mkv and .mp4 files in the current directory and allows you to select which files to process (or press Enter to select all).
+You can then choose a language from a menu (default is English), and the script will set the audio language tag for each selected file:
+- For MKV files, it uses mkvpropedit to set the language of the first audio track.
+- For MP4 files, it uses MP4Box to set the language.
+
+Usage:
+    python3 setaudio
+    # Follow the prompts to select files and language.
+
+Requirements:
+    - mkvpropedit (part of mkvtoolnix) for MKV files
+    - MP4Box for MP4 files
+    - Both must be installed and in your PATH
+
+This is useful for ensuring your media files have the correct audio language tag for compatibility with media players and libraries.
+"""
+
+import os
+import subprocess
+
+# List of languages
+languages = [
+    ("English", "eng"),
+    ("Portuguese", "por"),
+    ("Spanish", "spa"),
+    ("German", "ger"),
+    ("French", "fre"),
+    ("Norwegian", "nor"),
+    ("Swedish", "swe"),
+    ("Korean", "kor"),
+    ("Japanese", "jpn"),
+    ("Chinese", "chi"),
+    ("Russian", "rus"),
+    ("Italian", "ita"),
+    ("Dutch", "dut"),
+    ("Danish", "dan"),
+    ("Finnish", "fin"),
+    ("Polish", "pol"),
+    ("Czech", "ces"),
+    ("Hungarian", "hun"),
+    ("Greek", "ell"),
+    ("Turkish", "tur")
+]
+
+# Function to list all .mkv and .mp4 files
+def list_files():
+    print("Listing video files in the current directory:")
+    files = [f for f in os.listdir() if f.endswith('.mkv') or f.endswith('.mp4')]
+    for i, file in enumerate(files, 1):
+        print(f"{i}: {file}")
+    return files
+
+# Function to choose files
+def choose_files(files):
+    chosen_files = input("Enter the numbers of the files you want to process, comma separated (leave empty to select all): ")
+    if not chosen_files:
+        return files
+    else:
+        chosen_indices = [int(x.strip()) - 1 for x in chosen_files.split(',')]
+        return [files[i] for i in chosen_indices]
+
+def choose_language():
+    print("Choose the language for audio tracks:")
+    for i, (lang, code) in enumerate(languages, 1):
+        print(f"{i}: {lang}")
+    choice = input("Enter the number corresponding to the desired language [1]: ").strip()
+    if not choice:
+        return languages[0][1]  # Default to English (first in the list)
+    return languages[int(choice) - 1][1]  # Return the ISO code
+
+# Function to apply the language change to a file
+def apply_language(file, language_code):
+    if file.endswith('.mkv'):
+        print(f"Setting audio language to {language_code} for {file}")
+        subprocess.run(['mkvpropedit', '--edit', 'track:a1', '--set', f'language={language_code}', file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif file.endswith('.mp4'):
+        print(f"Setting audio language to {language_code} for {file}")
+        subprocess.run(['MP4Box', '-lang', language_code, file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        print(f"Unsupported file type for {file}")
+
+# Main function
+def main():
+    files = list_files()
+    chosen_files = choose_files(files)
+    language = choose_language()
+
+    for file in chosen_files:
+        apply_language(file, language)
+
+    print("Language setting completed.")
+
+if __name__ == "__main__":
+    main()
