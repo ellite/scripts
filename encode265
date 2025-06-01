@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+
+"""
+encode265: Batch re-encode video files to H.265/HEVC with hardware acceleration simultaniously with dGPU and iGPU.
+
+This script scans the current directory for video files (MKV, MP4, AVI, MOV) and allows you to select which files to encode.
+It supports Intel Arc and iGPU hardware acceleration via VAAPI, and can run parallel encodes if you have both GPUs.
+You can choose to scale video to 720p, convert audio to AAC 2.0, and select encoding quality or bitrate.
+Text-based subtitles are converted to SRT, while image-based subtitles (like PGS) are copied as-is.
+Only the first audio track is kept, and external subtitles are renamed to match the new file.
+The script shows a live progress bar, ETA, and encoding speed for each file.
+
+Features:
+- Interactive selection of files, GPU, encoding mode, and options.
+- Hardware-accelerated H.265/HEVC encoding using VAAPI.
+- Optional scaling to 720p and audio conversion to AAC 2.0.
+- Converts text subtitles to SRT, copies non-text subtitles.
+- Removes attachments from MKV files.
+- Keeps only the first audio track.
+- Renames external subtitles to match output.
+- Parallel encoding if both Arc and iGPU are available.
+- Live progress display with speed and ETA.
+- Optionally deletes original files after encoding.
+- Handles Ctrl+C gracefully, terminating all running encodes.
+- Encoding settings for small file size for space saving.
+
+Usage:
+    python3 encode265
+    # Follow the prompts to select files and options.
+
+Requirements:
+    - ffmpeg and ffprobe (with VAAPI support)
+    - Intel Arc and/or iGPU (for hardware acceleration)
+    - Python 3.7+
+    - Linux (tested on Ubuntu/Debian)
+
+This script is useful for efficiently batch-converting your media library to H.265/HEVC with hardware acceleration, while preserving compatibility and minimizing file size.
+"""
+
+import os
+import subprocess
+import re
+import json
+from pathlib import Path
+import threading
+import shutil
+import signal
+import sys
+import time
+import queue
+
+VIDEO_EXTENSIONS = ['.mkv', '.mp4', '.avi', '.mov']
+stop_requested = False
+processes = {}  # Store Popen objects for each encoding
+encode_info = {} # Store info like start time for ETA calculation
+
+def handle_sigint(signum, frame):
+    global stop_requested
+    stop_requested = True
+    print("\n🛑 Ctrl+C received. Attempting to terminate all encoding processes...")
+    for file, proc in processes.items():
+        print(f"🔻 Terminating process for: {file}")
+        proc.terminate()
+    sys.exit(1)    
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+def should_convert_audio(input_file):
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+            "stream=codec_name,channels", "-of", "json", input_file
+        ], capture_output=True, text=True)
+
+        data = json.loads(result.stdout)
+        stream = data.get("streams", [{}])[0]
+        codec = stream.get("codec_name", "").lower()
+        channels = stream.get("channels", 0)
+
+        return not (codec == "aac" and channels == 2)
+
+    except Exception as e:
+        print(f"⚠️ Could not determine audio stream info for {input_file}: {e}")
+        return True
+
+def list_media_files(directory):
+    files = [f for f in sorted(os.listdir(directory)) if Path(f).suffix.lower() in VIDEO_EXTENSIONS]
+    for idx, file in enumerate(files):
+        print(f"{idx + 1}. {file}")
+    return files
+
+def get_user_selection(files):
+    selection = input("Select files to encode by number (comma-separated), or press Enter for all: ").strip()
+    if not selection or selection.lower() == "all":
+        return files
+    indices = [int(i) - 1 for i in selection.split(",") if i.strip().isdigit() and 0 < int(i) <= len(files)]
+    return [files[i] for i in indices]
+
+def yes_no(prompt, default="no"):
+    default = default.lower()
+    options = "[Y/n]" if default == "yes" else "[y/N]"
+    choice = input(f"{prompt} {options}: ").strip().lower()
+
+    if not choice:
+        return default == "yes"
+    if choice in ["y", "yes"]:
+        return True
+    if choice in ["n", "no"]:
+        return False
+
+    print("Invalid choice. Using default.")
+    return default == "yes"
+
+def choose_gpu(multi=False):
+    print("\nChoose GPU for encoding:")
+    print("1) dGPU (default)")
+    print("2) iGPU")
+    if multi:
+        print("3) Both (parallel encodes)")
+    choice = input("Enter choice [1-3]: ").strip() if multi else input("Enter choice [1-2]: ").strip()
+    if choice == "2":
+        return ["/dev/dri/renderD128"]
+    elif multi and choice == "3":
+        return ["/dev/dri/renderD129", "/dev/dri/renderD128"]
+    return ["/dev/dri/renderD129"]
+
+def choose_encoding_mode():
+    print("\nChoose encoding mode:")
+    print("1) Auto-quality (QP 24) [default]")
+    print("2) Fixed bitrate (1M, slow preset)")
+    print("3) Fixed bitrate (2M, slow preset)")
+    choice = input("Enter choice: ").strip()
+    if choice == "2":
+        return "bitrate_1M"
+    elif choice == "3":
+        return "bitrate_2M"
+    return "qp"
+
+def choose_audio_bitrate():
+    print("\nChoose audio bitrate:")
+    print("1) 128 kbps (default)")
+    print("2) 160 kbps")
+    print("3) 256 kbps")
+    choice = input("Enter choice [1-3]: ").strip()
+
+    if choice == "2":
+        return "160k"
+    elif choice == "3":
+        return "256k"
+    else:
+        return "128k"
+
+def sanitize_filename(original_name, scaled, audio_converted):
+    name = original_name
+    name = re.sub(r'(h\.?264|x264)', 'x265', name, flags=re.IGNORECASE)
+    if scaled:
+        name = re.sub(r'(1080p|576p|480p)', '720p', name, flags=re.IGNORECASE)
+        if not re.search(r'720p', name, re.IGNORECASE):
+            name += ".720p"
+    if audio_converted:
+        name = re.sub(r'\b(dts|ac3|eac3|ddp|ddplus|mp3|ogg|flac|opus)\b', 'AAC', name, flags=re.IGNORECASE)
+        name = re.sub(r'\b(aac|ddp|dd\+|ddplus)[\s_.-]*5[\s_.-]*1\b', 'AAC2.0', name, flags=re.IGNORECASE)
+        name = re.sub(r'\b5[\s_.-]*1\b', '2.0', name, flags=re.IGNORECASE)
+        name = re.sub(r'\b(atmos)\b', 'AAC', name, flags=re.IGNORECASE)
+    return name
+
+def rename_external_subtitles(original_file, new_file):
+    original_stem = Path(original_file).stem
+    new_stem = Path(new_file).stem
+    for sub in Path(original_file).parent.glob(f"{original_stem}.*.srt"):
+        lang = sub.suffixes[-2] if len(sub.suffixes) > 1 else ""
+        new_sub_name = f"{new_stem}{lang}.srt"
+        new_sub_path = sub.parent / new_sub_name
+        print(f"📄 Renaming subtitle: {sub.name} -> {new_sub_name}")
+        shutil.move(sub, new_sub_path)
+
+def get_subtitle_codecs(input_file):
+    """Return a list of subtitle codecs for all subtitle streams in the file."""
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "s", "-show_entries",
+            "stream=index,codec_name", "-of", "json", input_file
+        ], capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        return [(s["index"], s.get("codec_name", "")) for s in data.get("streams", [])]
+    except Exception as e:
+        print(f"⚠️ Could not determine subtitle codecs for {input_file}: {e}")
+        return []        
+
+def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu_device, encoding_mode):
+    path = Path(input_file)
+    new_stem = sanitize_filename(path.stem, scale, convert_audio)
+    out_file = f"{new_stem}.mkv"
+
+    if Path(input_file).resolve() == Path(out_file).resolve():
+        out_file = f"{new_stem}_x265.mkv"
+        print(f"⚠️ Output file would overwrite input! Renaming output to: {out_file}")
+
+    scale_filter = "scale=w=1280:-2," if scale else ""
+
+    if convert_audio and should_convert_audio(input_file):
+        audio_args = ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
+    else:
+        audio_args = ["-c:a", "copy"]
+
+    # Subtitle handling
+    subtitle_codecs = get_subtitle_codecs(input_file)
+    subtitle_args = ["-map", "0:V", "-map", "0:a:0", "-map", "0:s?"] # Map all video, audio, and subtitle streams (Do not map attachments)
+
+    # Only text-based codecs should be converted to srt
+    text_codecs = {"ass", "ssa", "subrip", "srt", "text", "mov_text"}
+    for out_idx, (in_idx, codec) in enumerate(subtitle_codecs):
+        if codec.lower() in text_codecs:
+            subtitle_args += [f"-c:s:{out_idx}", "srt"]
+        else:
+            subtitle_args += [f"-c:s:{out_idx}", "copy"]
+
+    video_args = ["-c:V", "hevc_vaapi"]
+    if encoding_mode == "qp":
+        video_args += ["-qp", "24"]
+    elif encoding_mode == "bitrate_1M":
+        video_args += ["-b:v", "1M", "-preset", "slow"]
+    elif encoding_mode == "bitrate_2M":
+        video_args += ["-b:v", "2M", "-preset", "slow"]
+    else:
+        print(f"❌ Unknown encoding mode: {encoding_mode}. Defaulting to auto-quality (QP 24).")
+        video_args += ["-qp", "24"]
+
+    '''enable for debugging'''
+    '''print(f"\n🔧 Building FFmpeg command for {input_file}:\n{' '.join(['ffmpeg', '-hwaccel', 'vaapi', '-vaapi_device', gpu_device, '-i', input_file, '-vf', f'{scale_filter}format=nv12,hwupload'] + video_args + audio_args + subtitle_args + [out_file])}")
+    time.sleep(3)  # Give time for the user to read the command
+    input("\nPress Enter to continue...")'''
+
+    return [
+        "ffmpeg", "-hwaccel", "vaapi", "-vaapi_device", gpu_device,
+        "-i", input_file,
+        "-vf", f"{scale_filter}format=nv12,hwupload",
+        *video_args,
+        *audio_args,
+        *subtitle_args,
+        out_file
+    ]
+
+progress_display_lock = threading.Lock()
+progress_lines = {}
+
+def monitor_encoding_progress(file, process, gpu_device):
+    start_time = time.time()
+    duration = None
+    last_progress = ""
+    stderr_lines = []  # Collect all stderr output
+    speed = 1.0  # Default speed
+
+    while process.poll() is None and not stop_requested:
+        try:
+            while True:
+                stderr_output = process.stderr.readline()
+                if not stderr_output:
+                    break
+                stderr_output = stderr_output.strip()
+                if stderr_output:
+                    stderr_lines.append(stderr_output)  # Collect for later
+                    progress_match = re.search(r"Duration: (\d{2}:\d{2}:\d{2}\.\d{2})", stderr_output)
+                    if progress_match and not duration:
+                        duration = sum(float(x) * 60 ** i for i, x in enumerate(reversed(progress_match.group(1).split(':'))))
+
+                    time_match = re.search(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})", stderr_output)
+                    speed_match = re.search(r"speed=([\d\.]+)x", stderr_output)
+
+                    if time_match and duration:
+                        elapsed_time = time.time() - start_time
+                        current_time_seconds = sum(float(x) * 60 ** i for i, x in enumerate(reversed(time_match.group(1).split(':'))))
+                        progress = (current_time_seconds / duration) * 100 if duration > 0 else 0
+                        speed = float(speed_match.group(1)) if speed_match else speed
+                        eta = (duration - current_time_seconds) / speed if speed and speed > 0 else "N/A"
+
+                        bar_length = 30
+                        bar_fill = int(progress / 100 * bar_length)
+                        bar = '█' * bar_fill + '-' * (bar_length - bar_fill)
+                        gpu_name = "dGPU" if 'renderD129' in gpu_device else "iGPU"
+                        progress_str = f"🎬 {Path(file).name} | {gpu_name} | [{bar}] {progress:.2f}% | ⏱ {time.strftime('%H:%M:%S', time.gmtime(elapsed_time))}"
+                        if speed:
+                            progress_str += f" | Speed: {speed:.2f}x"
+                        if eta != "N/A":
+                            progress_str += f" | ETA: {time.strftime('%H:%M:%S', time.gmtime(eta))}"
+
+                        if progress_str != last_progress:
+                            with progress_display_lock:
+                                progress_lines[file] = progress_str
+                                os.system('clear')
+                                for line in progress_lines.values():
+                                    print(line)
+                                last_progress = progress_str
+            time.sleep(0.1)
+        except ValueError:
+            pass
+        except Exception as e:
+            print(f"\n⚠️ Error monitoring progress for {file}: {e}")
+            break
+    if stop_requested:
+        with progress_display_lock:
+            progress_lines[file] = f"🛑 Encoding of {Path(file).name} interrupted."
+            os.system('clear')
+            for line in progress_lines.values():
+                print(line)
+    elif process.returncode == 0:
+        with progress_display_lock:
+            progress_lines[file] = f"✅ Done: {Path(file).name} on {gpu_name} @ {speed}x"
+            os.system('clear')
+            for line in progress_lines.values():
+                print(line)     
+    else:
+        with progress_display_lock:
+            progress_lines[file] = f"❌ Encoding of {Path(file).name} failed (return code: {process.returncode})."
+            os.system('clear')
+            for line in progress_lines.values():
+                print(line)
+            print(f"\n🔍 FFmpeg Error Output for {file}:\n" + "\n".join(stderr_lines))
+            time.sleep(1)  # Give time to read the error
+
+def process_encoding(file, scale, convert_audio, audio_bitrate, gpu_device, encoding_mode, delete_originals):
+    global processes, encode_info
+    if stop_requested:
+        print(f"⏭️ Skipping: {file} (interrupted)")
+        return
+    print(f"\n▶️ Encoding: {file} using {gpu_device}")
+    cmd = build_ffmpeg_command(file, scale, convert_audio, audio_bitrate, gpu_device, encoding_mode)
+    out_file = cmd[-1]
+    try:
+        process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True) # Added text=True for easier decoding
+        processes[file] = process
+        encode_info[file] = {'start_time': time.time()}
+        monitor_thread = threading.Thread(target=monitor_encoding_progress, args=(file, process, gpu_device))
+        monitor_thread.daemon = True # Allow the main thread to exit even if this is running
+        monitor_thread.start()
+        process.wait()
+        monitor_thread.join(timeout=0.1) # Give it a little time to finish any last prints
+        del processes[file]
+        del encode_info[file]
+    except FileNotFoundError:
+        print(f"❌ Error: ffmpeg not found. Please ensure it's installed and in your PATH.")
+        return
+    except KeyboardInterrupt:
+        print(f"\n🛑 Encoding of {file} interrupted by user.")
+        if process:
+            process.terminate()
+        raise
+    except Exception as e:
+        print(f"\n⚠️ An error occurred during encoding of {file}: {e}")
+        progress_lines[file] = f"❌ Encoding of {Path(file).name} failed: {e}"
+        if process:
+            process.terminate()
+        return
+
+    if not stop_requested and process.returncode == 0:
+        rename_external_subtitles(file, out_file)
+        if delete_originals:
+            print(f"🗑️ Deleting original: {file}")
+            try:
+                os.remove(file)
+            except OSError as e:
+                print(f"⚠️ Error deleting {file}: {e}")
+
+def main():
+    current_dir = os.getcwd()
+    files = list_media_files(current_dir)
+    if not files:
+        print("No media files found.")
+        return
+
+    selected_files = get_user_selection(files)
+    scale = yes_no("Scale video to 720p?", default="no")
+    convert_audio = yes_no("Convert audio to AAC 2.0?", default="no")
+    audio_bitrate = None
+    if convert_audio:
+        audio_bitrate = choose_audio_bitrate()
+
+    encoding_mode = choose_encoding_mode()
+    use_both = len(selected_files) > 1
+    gpu_devices = choose_gpu(multi=use_both)
+    delete_originals = yes_no("Delete original files after encoding?", default="no")
+
+    if len(gpu_devices) == 2:
+        file_queue = queue.Queue()
+        for f in selected_files:
+            file_queue.put(f)
+
+        def gpu_worker(gpu):
+            while not file_queue.empty() and not stop_requested:
+                try:
+                    file = file_queue.get_nowait()
+                except queue.Empty:
+                    break
+                process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, delete_originals)
+                file_queue.task_done()
+
+        threads = []
+        for gpu in gpu_devices:
+            t = threading.Thread(target=gpu_worker, args=(gpu,))
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+    else:
+        for file in selected_files:
+            if stop_requested:
+                print("🛑 Stopped by user.")
+                break
+            process_encoding(file, scale, convert_audio, audio_bitrate, gpu_devices[0], encoding_mode, delete_originals)
+
+if __name__ == "__main__":
+    main()
