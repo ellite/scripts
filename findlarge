@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+
+"""
+findlarge: List the largest files in your TV or Movies library.
+
+This script scans either your TV or Movies folder (as defined by TV_PATH and MOVIES_PATH),
+recursively listing all files except those in excluded folders or with excluded keywords.
+It then prints the N largest files (default 10), showing their human-readable size and full path.
+
+Features:
+- Excludes specific folders and files with certain keywords (customizable).
+- Uses colorized output for file sizes (requires colorama and humanize).
+- User chooses which library to scan and how many files to list.
+- Useful for finding space hogs or cleaning up your media library.
+
+Usage:
+    python3 findlarge
+    # Follow the prompts to select TV or Movies and how many files to list.
+
+Requirements:
+    pip install colorama humanize
+"""
+
+import os
+import sys
+import humanize
+from colorama import Fore, Style, init
+
+# Initialize colorama
+init(autoreset=True)
+
+TV_PATH = "/Media/TV"
+MOVIES_PATH = "/Media/Movies"
+
+EXCLUDED_FOLDERS = ["Folder1"]
+
+EXCLUDED_KEYWORDS = ["Keyword1"]
+
+def get_choice():
+    print("Which folder do you want to scan?")
+    print("1. TV")
+    print("2. Movies")
+    choice = input("Enter 1 or 2: ")
+    if choice == "1":
+        return TV_PATH
+    elif choice == "2":
+        return MOVIES_PATH
+    else:
+        print("Invalid choice.")
+        sys.exit(1)
+
+def get_limit():
+    try:
+        count_str = input("How many largest files do you want to list? [10]: ").strip()
+        count = int(count_str) if count_str else 10
+        return max(1, count)
+    except ValueError:
+        print("Invalid number.")
+        sys.exit(1)
+
+def list_largest_files(base_path, excluded_folders, excluded_keywords, limit):
+    file_list = []
+
+    for root, dirs, files in os.walk(base_path):
+        # Skip excluded folders
+        if any(excluded.lower() in root.lower() for excluded in excluded_folders):
+            continue
+
+        for file in files:
+            full_path = os.path.join(root, file)
+            # Skip excluded keywords
+            if any(keyword.lower() in file.lower() for keyword in excluded_keywords):
+                continue
+            try:
+                size = os.path.getsize(full_path)
+                file_list.append((full_path, size))
+            except OSError:
+                continue
+
+    # Sort by size descending
+    file_list.sort(key=lambda x: x[1], reverse=True)
+
+    print(f"\nTop {limit} largest files in '{base_path}':\n")
+    for path, size in file_list[:limit]:
+        size_colored = Fore.CYAN + humanize.naturalsize(size, binary=True) + Style.RESET_ALL
+        print(f"{size_colored:>10} - {path}")
+
+if __name__ == "__main__":
+    selected_path = get_choice()
+    file_limit = get_limit()
+    list_largest_files(selected_path, EXCLUDED_FOLDERS, EXCLUDED_KEYWORDS, file_limit)
