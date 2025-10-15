@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+GPU Whisper transcription / translation using faster-whisper.
+
+Features
+────────
+• Lists media files for selection
+• Auto language detection (printed immediately)
+• Optional English translation (skipped if already English)
+• Real-time segment output
+• Accurate timing summaries
+• Uses GPU (float16)
+• Default model: large
+"""
+
+import os
+import time
+from datetime import timedelta
+from faster_whisper import WhisperModel
+
+
+# ---------- Helpers ----------
+
+def list_media_files():
+    files = [f for f in sorted(os.listdir()) if f.lower().endswith(('.mkv', '.mp4', '.mp3'))]
+    for idx, file in enumerate(files, 1):
+        print(f"{idx}: {file}")
+    return files
+
+
+def get_user_selection(files):
+    selection = input("Enter numbers of files to transcribe (comma-separated), or press Enter for all: ").strip()
+    if not selection:
+        return files
+    idxs = [int(i) - 1 for i in selection.split(",") if i.strip().isdigit() and 0 < int(i) <= len(files)]
+    return [files[i] for i in idxs]
+
+
+def choose_model():
+    print("\nChoose Whisper model size:")
+    print("1) tiny\n2) base\n3) small\n4) medium\n5) large-v3 (default)")
+    choice = input("Enter number [default: 5]: ").strip()
+    return {"1": "tiny", "2": "base", "3": "small", "4": "medium", "5": "large-v3"}.get(choice, "large-v3")
+
+
+def choose_task():
+    print("\nTask options:")
+    print("1) Transcribe only")
+    print("2) Transcribe + Translate to English")
+    choice = input("Enter number [default: 1]: ").strip()
+    return "both" if choice == "2" else "transcribe"
+
+
+def format_time(seconds):
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    ms = (seconds - int(seconds)) * 1000
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{int(ms):03d}"
+
+
+def write_srt(filename, segments):
+    with open(filename, "w", encoding="utf-8") as srt_file:
+        for i, seg in enumerate(segments, start=1):
+            srt_file.write(f"{i}\n{format_time(seg.start)} --> {format_time(seg.end)}\n{seg.text.strip()}\n\n")
+    print(f"✅ Saved subtitles to: {filename}")
+
+
+# ---------- Core ----------
+
+def transcribe_file(input_file, model, task_mode):
+    overall_start = time.time()
+    print(f"\n🎧 Processing: {input_file}")
+    base = os.path.splitext(input_file)[0]
+
+    # ----- Detect language -----
+    print("🌍 Detecting language…")
+    _, info = model.transcribe(input_file, beam_size=1, vad_filter=True, task="transcribe", max_initial_timestamp=30)
+    print(f"🌍 Detected language: {info.language.upper()} (Probability {info.language_probability * 100:.0f}%)")
+
+    # ----- Transcription -----
+    print("📝 Transcribing…")
+    trans_start = time.time()
+
+    segments_gen, _ = model.transcribe(
+        input_file,
+        beam_size=5,
+        vad_filter=True,
+        task="transcribe"
+    )
+
+    srt_path = f"{base}.{info.language}.srt"
+    with open(srt_path, "w", encoding="utf-8") as srt_file:
+        for i, seg in enumerate(segments_gen, start=1):
+            start_time = format_time(seg.start)
+            end_time = format_time(seg.end)
+            text = seg.text.strip()
+            print(f"[{start_time} - {end_time}] {text}")
+            srt_file.write(f"{i}\n{start_time} --> {end_time}\n{text}\n\n")
+
+    trans_end = time.time()
+    print(f"✅ Saved subtitles to: {srt_path}")
+    print(f"🕒 Transcription completed in {trans_end - trans_start:.1f} seconds")
+
+    # ----- Optional translation -----
+    if task_mode == "both":
+        if info.language.lower().startswith("en"):
+            print("⚠️  Skipping translation — source language already English.")
+        else:
+            print("\n🌐 Translating to English…")
+            transl_start = time.time()
+
+            translated_gen, _ = model.transcribe(
+                input_file,
+                beam_size=5,
+                vad_filter=True,
+                task="translate"
+            )
+            translated_segments = list(translated_gen)
+            transl_end = time.time()
+
+            t_srt = f"{base}.en.srt"
+            write_srt(t_srt, translated_segments)
+            print(f"🕒 Translation completed in {transl_end - trans_end:.1f} seconds")
+
+    overall_end = time.time()
+    total_time = overall_end - overall_start
+    print(f"🕒 Total processing time: {total_time:.1f} seconds\n")
+
+
+# ---------- Main ----------
+
+def main():
+    files = list_media_files()
+    if not files:
+        print("No media files found.")
+        return
+
+    selected = get_user_selection(files)
+    model_size = choose_model()
+    task_mode = choose_task()
+
+    print(f"\n🔁 Loading model {model_size} on GPU (float16)…")
+    model = WhisperModel(model_size, device="cuda", compute_type="float16")
+
+    for f in selected:
+        transcribe_file(f, model, task_mode)
+
+
+if __name__ == "__main__":
+    main()
