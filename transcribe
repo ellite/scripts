@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-GPU Whisper transcription / translation using faster-whisper.
-
-Features
-────────
+GPU Whisper transcription / translation (v2)
+────────────────────────────────────────────
 • Lists media files for selection
-• Auto language detection (printed immediately)
-• Optional English translation (skipped if already English)
-• Real-time segment output
-• Accurate timing summaries
+• Auto language detection
+• Accuracy modes: Fast / Balanced / Max
+• Optional English translation
+• Real-time output with word-level timestamps
 • Uses GPU (float16)
-• Default model: large
+• Defaults to: large-v3-turbo (if available)
 """
 
 import os
@@ -22,7 +20,7 @@ from faster_whisper import WhisperModel
 # ---------- Helpers ----------
 
 def list_media_files():
-    files = [f for f in sorted(os.listdir()) if f.lower().endswith(('.mkv', '.mp4', '.mp3'))]
+    files = [f for f in sorted(os.listdir()) if f.lower().endswith(('.mkv', '.mp4', '.mp3', '.wav', '.m4a'))]
     for idx, file in enumerate(files, 1):
         print(f"{idx}: {file}")
     return files
@@ -36,11 +34,13 @@ def get_user_selection(files):
     return [files[i] for i in idxs]
 
 
-def choose_model():
-    print("\nChoose Whisper model size:")
-    print("1) tiny\n2) base\n3) small\n4) medium\n5) large-v3 (default)")
-    choice = input("Enter number [default: 5]: ").strip()
-    return {"1": "tiny", "2": "base", "3": "small", "4": "medium", "5": "large-v3"}.get(choice, "large-v3")
+def choose_accuracy():
+    print("\nAccuracy mode:")
+    print("1) ⚡ Fast (small-v3)")
+    print("2) ⚖️  Balanced (medium-v3)")
+    print("3) 🧠 Max accuracy (large-v3-turbo if available, else large-v3) [default]")
+    choice = input("Enter number [default: 3]: ").strip()
+    return {"1": "small-v3", "2": "medium-v3", "3": "large-v3-turbo"}.get(choice, "large-v3-turbo")
 
 
 def choose_task():
@@ -49,7 +49,6 @@ def choose_task():
     print("2) Transcribe + Translate to English")
     choice = input("Enter number [default: 1]: ").strip()
     return "both" if choice == "2" else "transcribe"
-
 
 def format_time(seconds):
     minutes, seconds = divmod(seconds, 60)
@@ -64,7 +63,6 @@ def write_srt(filename, segments):
             srt_file.write(f"{i}\n{format_time(seg.start)} --> {format_time(seg.end)}\n{seg.text.strip()}\n\n")
     print(f"✅ Saved subtitles to: {filename}")
 
-
 # ---------- Core ----------
 
 def transcribe_file(input_file, model, task_mode):
@@ -75,16 +73,17 @@ def transcribe_file(input_file, model, task_mode):
     # ----- Detect language -----
     print("🌍 Detecting language…")
     _, info = model.transcribe(input_file, beam_size=1, vad_filter=True, task="transcribe", max_initial_timestamp=30)
-    print(f"🌍 Detected language: {info.language.upper()} (Probability {info.language_probability * 100:.0f}%)")
+    print(f"🌍 Detected language: {info.language.upper()} ({info.language_probability * 100:.0f}%)")
 
     # ----- Transcription -----
-    print("📝 Transcribing…")
+    print("📝 Transcribing with word-level precision…")
     trans_start = time.time()
 
     segments_gen, _ = model.transcribe(
         input_file,
         beam_size=5,
         vad_filter=True,
+        word_timestamps=True,
         task="transcribe"
     )
 
@@ -113,6 +112,7 @@ def transcribe_file(input_file, model, task_mode):
                 input_file,
                 beam_size=5,
                 vad_filter=True,
+                word_timestamps=True,
                 task="translate"
             )
             translated_segments = list(translated_gen)
@@ -136,11 +136,18 @@ def main():
         return
 
     selected = get_user_selection(files)
-    model_size = choose_model()
+    model_size = choose_accuracy()
     task_mode = choose_task()
 
     print(f"\n🔁 Loading model {model_size} on GPU (float16)…")
-    model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    try:
+        model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    except Exception as e:
+        if "large-v3-turbo" in model_size:
+            print("⚠️ large-v3-turbo not found, falling back to large-v3")
+            model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        else:
+            raise e
 
     for f in selected:
         transcribe_file(f, model, task_mode)
