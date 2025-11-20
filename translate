@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Universal subtitle translator using OPUS-MT (EN→PT only) or NLLB-200 1.3B.
+Universal subtitle translator using OPUS-MT (EN→PT only) or NLLB-200/M2M100.
 
 Enhancements:
 ──────────────
 • Only asks once for destination language and model per source language
 • Caches selections for full-season batches
-• EN→PT offers OPUS-MT (EU Portuguese) or NLLB-1.3B
-• All other pairs use NLLB-1.3B
+• EN→PT offers OPUS-MT, NLLB-1.3B, M2M100-1.2B or NLLB-3.3B
+• All other pairs use NLLB-1.3B, M2M100-1.2B or NLLB-3.3B
 """
 
 import os
@@ -47,22 +47,23 @@ def strip_all_lang_suffixes(base):
     return re.sub(r'(\.[a-z]{2}(-[a-z]{2})?)+$', '', base, flags=re.I)
 
 
-def translate_batch(texts, tokenizer, model, device, is_marian=False):
+# ---------- Translation ----------
+
+def translate_batch(texts, tokenizer, model, device, is_marian=False, forced_bos_token_id=None):
     inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
-    forced_bos_token_id = None
-    if not is_marian and hasattr(tokenizer, "tgt_lang"):
-        forced_bos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.tgt_lang)
+
     outputs = model.generate(
         **inputs,
-        forced_bos_token_id=forced_bos_token_id,
+        forced_bos_token_id=forced_bos_token_id,  # NLLB or M2M100
         num_beams=4,
         max_length=256,
         no_repeat_ngram_size=3
     )
+
     return [tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
 
 
-def translate_srt(file_path, tokenizer, model, device, src_short, tgt_short, is_marian, model_name):
+def translate_srt(file_path, tokenizer, model, device, src_short, tgt_short, is_marian, model_name, forced_bos):
     start = time.time()
     base, _ = os.path.splitext(file_path)
     base_no_lang = strip_all_lang_suffixes(base)
@@ -72,38 +73,59 @@ def translate_srt(file_path, tokenizer, model, device, src_short, tgt_short, is_
         content = f.read().strip()
 
     blocks = re.split(r"\n\n+", content)
-    texts, metas = [], []
+
+    # Each entry: (idx, timing, list_of_lines)
+    metas = []
+    all_lines = []    # flat list of ALL subtitle lines from all blocks
+
     for block in blocks:
         parts = block.strip().splitlines()
         if len(parts) < 3:
             continue
-        idx, timing, text = parts[0], parts[1], " ".join(parts[2:])
-        metas.append((idx, timing))
-        texts.append(text)
 
-    print(f"🌍 Using {model_name}  [{len(texts)} lines]")
+        idx = parts[0]
+        timing = parts[1]
+        lines = parts[2:]  # ← list of original lines (NOT merged)
 
+        metas.append((idx, timing, len(lines)))
+        all_lines.extend(lines)
+
+    print(f"🌍 Using {model_name}  [{len(all_lines)} total lines]")
+
+    # --- Translate all lines batch-wise ---
+    out_lines = []
     batch_size = 16
-    out_texts = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        out_texts.extend(translate_batch(batch, tokenizer, model, device, is_marian))
-        pct = int((i + len(batch)) / max(1, len(texts)) * 100)
+
+    for i in range(0, len(all_lines), batch_size):
+        batch = all_lines[i:i+batch_size]
+        out_lines.extend(translate_batch(
+            batch, tokenizer, model, device,
+            is_marian=is_marian,
+            forced_bos_token_id=forced_bos
+        ))
+        pct = int((i + len(batch)) / max(1, len(all_lines)) * 100)
         print(f"⏳ {pct}% complete...", end="\r")
 
-    out_blocks = []
-    for (idx, timing), t in zip(metas, out_texts):
-        out_blocks.append(f"{idx}\n{timing}\n{t.strip()}")
+    # --- Rebuild structure ---
+    final_blocks = []
+    cursor = 0
+
+    for (idx, timing, line_count) in metas:
+        translated_block_lines = out_lines[cursor: cursor + line_count]
+        cursor += line_count
+
+        # Keep exact original structure
+        block_text = "\n".join(translated_block_lines)
+        final_blocks.append(f"{idx}\n{timing}\n{block_text}")
 
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(out_blocks))
+        f.write("\n\n".join(final_blocks))
 
-    elapsed = time.time() - start
-    print(f"\n✅ Saved translated subtitles to: {out_path}")
-    print(f"⏱ Translation completed in {elapsed:.1f}s\n")
+    print(f"\n\n✅ Saved translated subtitles to: {out_path}")
+    print(f"⏱ Translation completed in {time.time() - start:.1f}s\n")
 
 
-# ---------- Main ----------
+# ---------------------- MAIN ----------------------
 
 def main():
     files = list_srt_files()
@@ -115,7 +137,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n💻 Using device: {device.upper()}")
 
-    # Remember previous selection per source language
     previous_settings = {}
 
     for path in selected:
@@ -125,12 +146,12 @@ def main():
         if src_short:
             print(f"🌍 Detected source: {src_short.upper()}")
         else:
-            src_short = input("Enter source language (2-letter, e.g., en, pt, es): ").strip().lower() or "en"
+            src_short = input("Enter source language (2-letter, e.g., en, pt, fr): ").strip().lower() or "en"
 
-        # Check if we already have a cached setting
         if src_short in previous_settings:
-            tgt_short, is_marian, model_name, tokenizer, model = previous_settings[src_short]
-            print(f"🔁 Reusing previous settings for {src_short.upper()} → {tgt_short.upper()} ({model_name})")
+            tgt_short, is_marian, model_name, tokenizer, model, forced_bos = previous_settings[src_short]
+            print(f"🔁 Reusing settings for {src_short.upper()} → {tgt_short.upper()} ({model_name})")
+
         else:
             tgt_short = input("Enter destination language (2-letter, e.g., en, pt, fr): ").strip().lower() or "en"
 
@@ -138,24 +159,43 @@ def main():
                 print("⚠️  Source and destination are the same. Skipping.")
                 continue
 
-            # ---------- Model selection ----------
+            # Default model
             is_marian = False
             model_name = "facebook/nllb-200-1.3B"
 
             if (src_short, tgt_short) == ("en", "pt"):
                 print("\nChoose translation engine:")
-                print("1) OPUS-MT (European Portuguese, smaller, faster)")
-                print("2) NLLB-200 1.3B (larger, more general multilingual)")
+                print("1) NLLB-200 1.3B (Multilingual, large, default)")
+                print("2) NLLB-200 3.3B (Multilingual, very large)")
+                print("3) M2M100 1.2B (Multilingual, medium)")
+                print("4) OPUS-MT (European Portuguese, smaller, faster)")
+
                 choice = input("Enter number [1]: ").strip() or "1"
+
                 if choice == "1":
+                    model_name = "facebook/nllb-200-1.3B"
+                    is_marian = False
+
+                elif choice == "2":
+                    model_name = "facebook/nllb-200-3.3B"
+                    is_marian = False
+
+                elif choice == "3":
+                    model_name = "facebook/m2m100_1.2B"
+                    is_marian = False
+
+                elif choice == "4":
                     model_name = "Helsinki-NLP/opus-mt-tc-big-en-pt"
                     is_marian = True
 
             print(f"\n🔁 Loading model: {model_name}")
 
+            # --- Load Marian (OPUS-MT) ---
             if is_marian:
                 tokenizer = MarianTokenizer.from_pretrained(model_name)
                 model = MarianMTModel.from_pretrained(model_name).to(device)
+                forced_bos = None
+
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_name)
                 model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -163,35 +203,35 @@ def main():
                     dtype=torch.float16 if device == "cuda" else torch.float32
                 ).to(device)
 
-                # --- Full NLLB language code map ---
-                NLLB_MAP = {
-                    "af":"afr_Latn","am":"amh_Ethi","ar":"arb_Arab","az":"azj_Latn","be":"bel_Cyrl","bg":"bul_Cyrl",
-                    "bn":"ben_Beng","bs":"bos_Latn","ca":"cat_Latn","cs":"ces_Latn","cy":"cym_Latn","da":"dan_Latn",
-                    "de":"deu_Latn","el":"ell_Grek","en":"eng_Latn","es":"spa_Latn","et":"est_Latn","eu":"eus_Latn",
-                    "fa":"pes_Arab","fi":"fin_Latn","fr":"fra_Latn","gl":"glg_Latn","gu":"guj_Gujr","he":"heb_Hebr",
-                    "hi":"hin_Deva","hr":"hrv_Latn","hu":"hun_Latn","hy":"hye_Armn","id":"ind_Latn","is":"isl_Latn",
-                    "it":"ita_Latn","ja":"jpn_Jpan","jv":"jav_Latn","ka":"kat_Geor","kk":"kaz_Cyrl","km":"khm_Khmr",
-                    "kn":"kan_Knda","ko":"kor_Hang","lo":"lao_Laoo","lt":"lit_Latn","lv":"lvs_Latn","mk":"mkd_Cyrl",
-                    "ml":"mal_Mlym","mn":"khk_Cyrl","mr":"mar_Deva","ms":"zsm_Latn","my":"mya_Mymr","nl":"nld_Latn",
-                    "no":"nob_Latn","or":"ory_Orya","pa":"pan_Guru","pl":"pol_Latn","ps":"pbt_Arab","pt":"por_Latn",
-                    "ro":"ron_Latn","ru":"rus_Cyrl","sd":"snd_Arab","si":"sin_Sinh","sk":"slk_Latn","sl":"slv_Latn",
-                    "so":"som_Latn","sq":"als_Latn","sr":"srp_Cyrl","sv":"swe_Latn","sw":"swh_Latn","ta":"tam_Taml",
-                    "te":"tel_Telu","th":"tha_Thai","tl":"tgl_Latn","tr":"tur_Latn","uk":"ukr_Cyrl","ur":"urd_Arab",
-                    "uz":"uzn_Latn","vi":"vie_Latn","yo":"yor_Latn","zh":"zho_Hans","zh-tw":"zho_Hant","zu":"zul_Latn",
-                }
+                # --------- M2M100 SPECIFIC FIX ---------
+                if "m2m100" in model_name.lower():
+                    tokenizer.src_lang = src_short
+                    forced_bos = tokenizer.get_lang_id(tgt_short)
+                else:
+                    # --------- NLLB LANGUAGE CODES ---------
+                    NLLB_MAP = {
+                        "af":"afr_Latn","am":"amh_Ethi","ar":"arb_Arab","az":"azj_Latn","be":"bel_Cyrl","bg":"bul_Cyrl",
+                        "bn":"ben_Beng","bs":"bos_Latn","ca":"cat_Latn","cs":"ces_Latn","cy":"cym_Latn","da":"dan_Latn",
+                        "de":"deu_Latn","el":"ell_Grek","en":"eng_Latn","es":"spa_Latn","et":"est_Latn","eu":"eus_Latn",
+                        "fa":"pes_Arab","fi":"fin_Latn","fr":"fra_Latn","gl":"glg_Latn","gu":"guj_Gujr","he":"heb_Hebr",
+                        "hi":"hin_Deva","hr":"hrv_Latn","hu":"hun_Latn","hy":"hye_Armn","id":"ind_Latn","is":"isl_Latn",
+                        "it":"ita_Latn","ja":"jpn_Jpan","jv":"jav_Latn","ka":"kat_Geor","kk":"kaz_Cyrl","km":"khm_Khmr",
+                        "kn":"kan_Knda","ko":"kor_Hang","lo":"lao_Laoo","lt":"lit_Latn","lv":"lvs_Latn","mk":"mkd_Cyrl",
+                        "ml":"mal_Mlym","mn":"khk_Cyrl","mr":"mar_Deva","ms":"zsm_Latn","my":"mya_Mymr","nl":"nld_Latn",
+                        "no":"nob_Latn","or":"ory_Orya","pa":"pan_Guru","pl":"pol_Latn","ps":"pbt_Arab","pt":"por_Latn",
+                        "ro":"ron_Latn","ru":"rus_Cyrl","sd":"snd_Arab","si":"sin_Sinh","sk":"slk_Latn","sl":"slv_Latn",
+                        "so":"som_Latn","sq":"als_Latn","sr":"srp_Cyrl","sv":"swe_Latn","sw":"swh_Latn","ta":"tam_Taml",
+                        "te":"tel_Telu","th":"tha_Thai","tl":"tgl_Latn","tr":"tur_Latn","uk":"ukr_Cyrl","ur":"urd_Arab",
+                        "uz":"uzn_Latn","vi":"vie_Latn","yo":"yor_Latn","zh":"zho_Hans","zh-tw":"zho_Hant","zu":"zul_Latn",
+                    }
 
-                def to_nllb(code: str) -> str:
-                    code = code.strip().lower()
-                    return NLLB_MAP.get(code, f"{code}_Latn")
+                    tokenizer.src_lang = NLLB_MAP.get(src_short, "eng_Latn")
+                    tokenizer.tgt_lang = NLLB_MAP.get(tgt_short, "por_Latn")
+                    forced_bos = tokenizer.convert_tokens_to_ids(tokenizer.tgt_lang)
 
-                tokenizer.src_lang = to_nllb(src_short)
-                tokenizer.tgt_lang = to_nllb(tgt_short)
-                print(f"🌐 NLLB direction: {tokenizer.src_lang} → {tokenizer.tgt_lang}")
+            previous_settings[src_short] = (tgt_short, is_marian, model_name, tokenizer, model, forced_bos)
 
-            # Cache for later reuse
-            previous_settings[src_short] = (tgt_short, is_marian, model_name, tokenizer, model)
-
-        translate_srt(path, tokenizer, model, device, src_short, tgt_short, is_marian, model_name)
+        translate_srt(path, tokenizer, model, device, src_short, tgt_short, is_marian, model_name, forced_bos)
 
 
 if __name__ == "__main__":
