@@ -26,7 +26,6 @@ Features:
 - Optionally deletes original files after encoding.
 - Handles Ctrl+C gracefully, terminating all running encodes.
 - Encoding settings optimized for small file size and good quality-to-speed balance.
-- Resets timestamps.
 
 Usage:
     python3 encode265
@@ -254,7 +253,7 @@ def detect_video_codec(input_file):
         return result.stdout.strip().lower()
     except Exception as e:
         print(f"⚠️ Could not detect codec for {input_file}: {e}")
-        return ""
+        return ""  
 
 def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, video_codec="x265"):
     """
@@ -336,8 +335,6 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
         else:
             vf_filter = "scale_cuda=w=iw:h=ih"
 
-        timestamp_fix = ["-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]    
-
         # Final command for NVIDIA
         cmd = [
             "ffmpeg",
@@ -348,7 +345,6 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             *video_args,
             *audio_args,
             *subtitle_args,
-            *timestamp_fix,
             out_file
         ]
         return cmd
@@ -374,7 +370,6 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             video_args += ["-qp", "24"]
 
         vf_filter = "scale=w=1280:-2,format=nv12,hwupload" if scale else "format=nv12,hwupload"
-        timestamp_fix = ["-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]
 
         cmd = [
             "ffmpeg",
@@ -384,7 +379,6 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             *video_args,
             *audio_args,
             *subtitle_args,
-            *timestamp_fix,
             out_file
         ]
         return cmd
@@ -490,6 +484,16 @@ def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mo
     """
 
     global processes, encode_info
+def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, delete_originals, video_codec="x265"):
+    """
+    Handles a single encoding job:
+      - Builds the ffmpeg command
+      - Starts the encoding process and monitors progress
+      - Applies timestamp fix after encoding (copy pass)
+      - Cleans up when finished
+    """
+
+    global processes, encode_info
 
     if stop_requested:
         print(f"⏭️ Skipping: {file} (interrupted)")
@@ -498,13 +502,15 @@ def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mo
     gpu_label = "NVIDIA RTX 2000E" if gpu["type"] == "nvidia" else "Intel iGPU"
     print(f"\n▶️ Encoding: {file} using {gpu_label}")
 
-    # Build the ffmpeg command
+    # Build ffmpeg command
     cmd = build_ffmpeg_command(file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, video_codec)
     out_file = cmd[-1]
 
-    # print("FFmpeg command:\n", " ".join(cmd))
     time.sleep(3)
 
+    # ------------------------------
+    # Run encoding
+    # ------------------------------
     try:
         process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
         processes[file] = process
@@ -523,29 +529,60 @@ def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mo
         del processes[file]
         del encode_info[file]
 
-    except FileNotFoundError:
-        print(f"❌ Error: ffmpeg not found. Please ensure it's installed and in your PATH.")
-        return
-    except KeyboardInterrupt:
-        print(f"\n🛑 Encoding of {file} interrupted by user.")
-        if process:
-            process.terminate()
-        raise
     except Exception as e:
-        print(f"\n⚠️ An error occurred during encoding of {file}: {e}")
-        progress_lines[file] = f"❌ Encoding of {Path(file).name} failed: {e}"
+        print(f"\n⚠️ Encoding of {file} failed: {e}")
         if process:
             process.terminate()
         return
 
-    if not stop_requested and process.returncode == 0:
-        rename_external_subtitles(file, out_file)
-        if delete_originals:
-            print(f"🗑️ Deleting original: {file}")
-            try:
-                os.remove(file)
-            except OSError as e:
-                print(f"⚠️ Error deleting {file}: {e}")
+    # ------------------------------
+    # If encode failed → stop
+    # ------------------------------
+    if process.returncode != 0:
+        print(f"❌ ffmpeg exited with code {process.returncode}. Skipping timestamp fix.")
+        return
+
+    # ------------------------------
+    # External subtitle renaming
+    # ------------------------------
+    rename_external_subtitles(file, out_file)
+
+    # ------------------------------
+    # Timestamp fix (copy pass)
+    # ------------------------------
+    print(f"🔧 Fixing timestamps: {out_file}")
+
+    fixed_file = out_file.replace(".mkv", ".fixed.mkv")
+
+    fix_cmd = [
+        "ffmpeg", "-loglevel", "error",
+        "-i", out_file,
+        "-map", "0",
+        "-c", "copy",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        fixed_file
+    ]
+
+    fix_proc = subprocess.run(fix_cmd)
+
+    if fix_proc.returncode == 0 and Path(fixed_file).exists() and Path(fixed_file).stat().st_size > 5000:
+        os.replace(fixed_file, out_file)
+        print(f"✔ Timestamp repair complete: {out_file}")
+    else:
+        print(f"⚠️ Timestamp fix failed, original kept.")
+        if Path(fixed_file).exists():
+            Path(fixed_file).unlink()
+
+    # ------------------------------
+    # Delete original if requested
+    # ------------------------------
+    if delete_originals:
+        print(f"🗑️ Deleting original: {file}")
+        try:
+            os.remove(file)
+        except OSError as e:
+            print(f"⚠️ Error deleting {file}: {e}")
 
 def main():
     """
