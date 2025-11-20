@@ -26,6 +26,7 @@ Features:
 - Optionally deletes original files after encoding.
 - Handles Ctrl+C gracefully, terminating all running encodes.
 - Encoding settings optimized for small file size and good quality-to-speed balance.
+- Resets timestamps.
 
 Usage:
     python3 encode265
@@ -335,6 +336,8 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
         else:
             vf_filter = "scale_cuda=w=iw:h=ih"
 
+        timestamp_fix = ["-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]    
+
         # Final command for NVIDIA
         cmd = [
             "ffmpeg",
@@ -345,6 +348,7 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             *video_args,
             *audio_args,
             *subtitle_args,
+            *timestamp_fix,
             out_file
         ]
         return cmd
@@ -370,6 +374,7 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             video_args += ["-qp", "24"]
 
         vf_filter = "scale=w=1280:-2,format=nv12,hwupload" if scale else "format=nv12,hwupload"
+        timestamp_fix = ["-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]
 
         cmd = [
             "ffmpeg",
@@ -379,6 +384,7 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             *video_args,
             *audio_args,
             *subtitle_args,
+            *timestamp_fix,
             out_file
         ]
         return cmd
