@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-cleansubtitlles: Remove style and formatting tags from subtitle files.
+cleansubtitlles: Remove style, formatting tags, and smileys from subtitle files.
 
 This script scans the current directory for all .srt, .ass, and .ssa subtitle files.
 It allows you to select which files to clean (or press Enter to clean all).
@@ -9,6 +9,7 @@ For each selected file, it removes:
 - ASS/SSA style tags like {\an3}, {\b1}, etc.
 - Any curly-brace tags { ... }
 - HTML-like tags such as <font ...>, </font>, <b>, </b>, etc.
+- Smiley emoticons like :-), :-(, :-O, :-/, ;-), etc.
 
 The cleaned subtitles overwrite the original files.
 
@@ -24,6 +25,10 @@ import sys
 import re
 from pathlib import Path
 
+# ----------------------------------------
+# Cleaning rules
+# ----------------------------------------
+
 def clean_subtitle_line(line):
     # Remove style tags like {\an3}, {\b1}, etc.
     line = re.sub(r'\{\\.*?\}', '', line)
@@ -31,41 +36,96 @@ def clean_subtitle_line(line):
     line = re.sub(r'\{.*?\}', '', line)
     # Remove HTML-like tags such as <font ...>, </font>, <b>, </b>, etc.
     line = re.sub(r'<[^>]+>', '', line)
+    # Remove smileys/emoticons
+    line = re.sub(r'(:-?[()O/s&])|(:[pD])|(;-\?)|([;:][oO/-]?[D>p])|(;-\))', '', line)
+
     return line.strip()
 
+
 def clean_subtitle_file(input_path, output_path=None):
-    with open(input_path, 'r', encoding='utf-8') as infile:
+    with open(input_path, 'r', encoding='utf-8', errors='ignore') as infile:
         lines = infile.readlines()
+
     cleaned_lines = [clean_subtitle_line(line) for line in lines]
+
     if output_path is None:
-        output_path = input_path
+        output_path = input_path  # overwrite file
+
     with open(output_path, 'w', encoding='utf-8') as outfile:
         for line in cleaned_lines:
             outfile.write(line + '\n')
 
+
+# ----------------------------------------
+# File selection
+# ----------------------------------------
+
 def list_subtitle_files():
     exts = ('.srt', '.ass', '.ssa')
     files = [f for f in sorted(os.listdir()) if f.lower().endswith(exts)]
+
     for idx, file in enumerate(files, 1):
         print(f"{idx}: {file}")
+
     return files
 
+
+def expand_range(text):
+    """ Expand '1,3-5,7' → [1,3,4,5,7] """
+    result = []
+    for part in text.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-")
+            if a.isdigit() and b.isdigit():
+                result.extend(range(int(a), int(b) + 1))
+        elif part.isdigit():
+            result.append(int(part))
+    return result
+
+
 def get_user_selection(files):
-    selection = input("Enter numbers of subtitle files to clean (comma-separated), or press Enter for all: ").strip()
+    selection = input(
+        "Enter numbers of subtitle files to clean "
+        "(comma-separated, ranges OK), or press Enter for all: "
+    ).strip()
+
+    # Press Enter → all files
     if not selection:
         return files
-    indices = [int(i) - 1 for i in selection.split(",") if i.strip().isdigit() and 0 < int(i) <= len(files)]
-    return [files[i] for i in indices]
+
+    indices = expand_range(selection)
+
+    selected_files = [
+        files[i - 1] for i in indices if 1 <= i <= len(files)
+    ]
+
+    return selected_files
+
+
+# ----------------------------------------
+# Main
+# ----------------------------------------
 
 def main():
     files = list_subtitle_files()
+
     if not files:
         print("No subtitle files found in this folder.")
         sys.exit(0)
+
     selected_files = get_user_selection(files)
+
+    if not selected_files:
+        print("No valid files selected.")
+        sys.exit(0)
+
     for file in selected_files:
         clean_subtitle_file(file)
-        print(f"Cleaned: {file}")
+        print(f"✔ Cleaned: {file}")
+
+    print("\nAll done!\n")
+
 
 if __name__ == "__main__":
     main()
