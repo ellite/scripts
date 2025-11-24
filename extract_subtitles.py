@@ -14,35 +14,23 @@ import json
 # Language mapping
 # ----------------------------------
 LANG_MAP = {
-    "eng": "en",
-    "en": "en",
-    "por": "pt",
-    "pt": "pt",
-    "spa": "es",
-    "es": "es",
-    "ger": "de",
-    "deu": "de",
-    "de": "de",
-    "fre": "fr",
-    "fra": "fr",
-    "fr": "fr",
-    "ita": "it",
-    "it": "it",
-    "jpn": "ja",
-    "ja": "ja",
-    "kor": "ko",
-    "ko": "ko",
-    "rus": "ru",
-    "ru": "ru"
+    "eng": "en", "en": "en",
+    "por": "pt", "pt": "pt",
+    "spa": "es", "es": "es",
+    "ger": "de", "deu": "de", "de": "de",
+    "fre": "fr", "fra": "fr", "fr": "fr",
+    "ita": "it", "it": "it",
+    "jpn": "ja", "ja": "ja",
+    "kor": "ko", "ko": "ko",
+    "rus": "ru", "ru": "ru"
 }
 
 def map_lang(code):
-    code = code.lower().strip()
-    return LANG_MAP.get(code, code)
+    return LANG_MAP.get(code.lower().strip(), code)
 
 
 # ----------------------------------
-# Expand ranges (1,3-5 → 1 3 4 5)
+# Parse ranges "1,3-5" → [1,3,4,5]
 # ----------------------------------
 def expand_range(text):
     result = []
@@ -51,7 +39,7 @@ def expand_range(text):
         if "-" in part:
             a, b = part.split("-")
             if a.isdigit() and b.isdigit():
-                result.extend(range(int(a), int(b) + 1))
+                result.extend(range(int(a), int(b)+1))
         elif part.isdigit():
             result.append(int(part))
     return result
@@ -61,9 +49,9 @@ def expand_range(text):
 # List video files
 # ----------------------------------
 def list_video_files():
-    files = [f for f in sorted(os.listdir()) if f.lower().endswith(('.mkv', '.mp4'))]
-    for idx, file in enumerate(files, 1):
-        print(f"{idx}: {file}")
+    files = [f for f in sorted(os.listdir()) if f.lower().endswith((".mkv", ".mp4"))]
+    for idx, f in enumerate(files, 1):
+        print(f"{idx}: {f}")
     return files
 
 
@@ -73,14 +61,13 @@ def get_file_selection(files):
         return files
 
     idxs = expand_range(sel)
-    selected = [files[i - 1] for i in idxs if 1 <= i <= len(files)]
-    return selected
+    return [files[i-1] for i in idxs if 1 <= i <= len(files)]
 
 
 # ----------------------------------
-# MKV: list subtitle tracks
+# MKV: Retrieve subtitle tracks
 # ----------------------------------
-def get_mkv_subtitle_tracks(file):
+def get_mkv_tracks(file):
     try:
         proc = subprocess.run(
             ["mkvmerge", "-i", "-F", "json", file],
@@ -101,10 +88,7 @@ def get_mkv_subtitle_tracks(file):
         lang = t["properties"].get("language", "und")
         name = t["properties"].get("track_name", "")
 
-        if "srt" in codec or "subrip" in codec:
-            stype = "srt"
-        else:
-            stype = "ass"
+        stype = "srt" if ("srt" in codec or "subrip" in codec) else "ass"
 
         tracks.append({
             "id": t["id"],
@@ -117,61 +101,95 @@ def get_mkv_subtitle_tracks(file):
 
 
 # ----------------------------------
-# Extract subtitles from MKV
+# MP4: Retrieve subtitle tracks (ffprobe)
+# ----------------------------------
+def get_mp4_tracks(file):
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", file],
+            capture_output=True, text=True, check=True
+        )
+    except Exception:
+        print(f"❌ ffprobe failed for {file}")
+        return []
+
+    data = json.loads(proc.stdout)
+    tracks = []
+    sid = 0  # sequential subtitle track index
+
+    for s in data.get("streams", []):
+        if s.get("codec_type") != "subtitle":
+            continue
+
+        codec = s.get("codec_name", "sub")
+        lang = s.get("tags", {}).get("language", "und")
+
+        stype = "srt" if codec in ("subrip", "srt") else "ass"
+
+        tracks.append({
+            "id": sid,
+            "lang": lang,
+            "type": stype,
+            "name": s.get("tags", {}).get("title", "")
+        })
+        sid += 1
+
+    return tracks
+
+
+# ----------------------------------
+# Extract MKV subtitle track → SRT
 # ----------------------------------
 def extract_mkv_subtitle(file, track):
-    base = Path(file).with_suffix('')
-    lang_out = map_lang(track["lang"])
+    base = Path(file).with_suffix("")
+    lang = map_lang(track["lang"])
+    tmp = f"{base}.track{track['id']}.tmp.{track['type']}"
+    out = f"{base}.{lang}.srt"
 
-    outname = f"{base}.{lang_out}.srt"
-    temp = f"{base}.track{track['id']}.tmp.{track['type']}"
+    # Extract track
+    cmd1 = ["mkvextract", "tracks", file, f"{track['id']}:{tmp}"]
+    cmd2 = ["ffmpeg", "-y", "-i", tmp, out]
 
-    # Extract
-    cmd_extract = [
-        "mkvextract", "tracks", file,
-        f"{track['id']}:{temp}"
+    try:
+        subprocess.run(cmd1, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"✅ {file} → {out}")
+    except Exception:
+        print(f"❌ Error extracting track {track['id']} from {file}")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# ----------------------------------
+# Extract MP4 subtitle track → SRT
+# ----------------------------------
+def extract_mp4_subtitle(file, track):
+    base = Path(file).with_suffix("")
+    lang = map_lang(track["lang"])
+    out = f"{base}.{lang}.srt"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", file,
+        "-map", f"0:s:{track['id']}",
+        out
     ]
 
     try:
-        subprocess.run(cmd_extract, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        print(f"❌ Failed to extract track {track['id']} from {file}")
-        return
-
-    # Convert to SRT
-    cmd_convert = ["ffmpeg", "-y", "-i", temp, outname]
-    try:
-        subprocess.run(cmd_convert, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"✅ {file} → {outname}")
-    except Exception:
-        print(f"❌ Failed to convert track {track['id']} to SRT")
-
-    finally:
-        if os.path.exists(temp):
-            os.remove(temp)
-
-
-# ----------------------------------
-# MP4 extraction (first subtitle only)
-# ----------------------------------
-def extract_mp4_subtitle(file):
-    base = Path(file).with_suffix('')
-    outname = f"{base}.en.srt"
-
-    cmd = ["ffmpeg", "-y", "-i", file, outname]
-
-    try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"✅ {file} → {outname}")
+        print(f"✅ {file} → {out}")
     except Exception:
-        print(f"❌ Failed extracting subtitles from {file}")
+        print(f"❌ Failed extracting subtitle track {track['id']} from {file}")
 
 
 # ----------------------------------
-# Main
+# MAIN
 # ----------------------------------
 def main():
     print("\n=== extractsubtitles ===\n")
+
     files = list_video_files()
     if not files:
         print("No MKV or MP4 files found.")
@@ -186,22 +204,30 @@ def main():
 
         ext = Path(file).suffix.lower()
 
-        # MP4:
-        if ext == ".mp4":
-            extract_mp4_subtitle(file)
-            continue
+        if ext == ".mkv":
+            tracks = get_mkv_tracks(file)
+            extractor = extract_mkv_subtitle
+        else:
+            tracks = get_mp4_tracks(file)
+            extractor = extract_mp4_subtitle
 
-        # MKV
-        tracks = get_mkv_subtitle_tracks(file)
         if not tracks:
             print("⚠️ No subtitle tracks found.")
             continue
 
+        # AUTO-EXTRACT if only ONE track
+        if len(tracks) == 1:
+            t = tracks[0]
+            print(f"➡️ Auto-extracting only subtitle track (ID {t['id']}, lang={t['lang']})...")
+            extractor(file, t)
+            continue
+
+        # Show available tracks
         print("Subtitle tracks:")
         for t in tracks:
             print(f"  {t['id']}: [{t['type']}] lang={t['lang']} name=\"{t['name']}\"")
 
-        sel = input("\nSelect subtitle tracks (comma-separated, ranges allowed): ").strip()
+        sel = input("\nSelect subtitle tracks (comma-separated / ranges): ").strip()
         if not sel:
             print("Skipping.")
             continue
@@ -214,8 +240,9 @@ def main():
             continue
 
         for t in chosen:
-            extract_mkv_subtitle(file, t)
+            extractor(file, t)
 
 
 if __name__ == "__main__":
     main()
+
