@@ -97,7 +97,7 @@ def translate_srt(file_path, tokenizer, model, device, src_short, tgt_short, is_
     start = time.time()
     base, _ = os.path.splitext(file_path)
     base_no_lang = strip_all_lang_suffixes(base)
-    out_path = f"{base_no_lang}.{tgt_short}.srt"
+    out_path = f"{base_no_lang}.{tgt_short}.ai.srt"
 
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read().strip()
@@ -194,30 +194,39 @@ def main():
             is_marian = False
             model_name = "facebook/nllb-200-1.3B"
 
-            if (src_short, tgt_short) == ("en", "pt"):
-                print("\nChoose translation engine:")
-                print("1) NLLB-200 1.3B (Multilingual, large, default)")
-                print("2) NLLB-200 3.3B (Multilingual, very large)")
-                print("3) M2M100 1.2B (Multilingual, medium)")
+            # Present multilingual engine choices for all language pairs.
+            # OPUS-MT (Marian) is only offered for the en→pt combination.
+            print("\nChoose translation engine:")
+            print("1) NLLB-200 1.3B (Multilingual, large, default)")
+            print("2) NLLB-200 3.3B (Multilingual, very large)")
+            print("3) M2M100 1.2B (Multilingual, medium)")
+
+            opus_option = (src_short, tgt_short) == ("en", "pt")
+            if opus_option:
                 print("4) OPUS-MT (European Portuguese, smaller, faster)")
 
-                choice = input("Enter number [1]: ").strip() or "1"
+            valid_choices = ["1", "2", "3"] + (["4"] if opus_option else [])
 
-                if choice == "1":
-                    model_name = "facebook/nllb-200-1.3B"
-                    is_marian = False
+            choice = input("Enter number [1]: ").strip() or "1"
+            if choice not in valid_choices:
+                print("Invalid choice, defaulting to 1")
+                choice = "1"
 
-                elif choice == "2":
-                    model_name = "facebook/nllb-200-3.3B"
-                    is_marian = False
+            if choice == "1":
+                model_name = "facebook/nllb-200-1.3B"
+                is_marian = False
 
-                elif choice == "3":
-                    model_name = "facebook/m2m100_1.2B"
-                    is_marian = False
+            elif choice == "2":
+                model_name = "facebook/nllb-200-3.3B"
+                is_marian = False
 
-                elif choice == "4":
-                    model_name = "Helsinki-NLP/opus-mt-tc-big-en-pt"
-                    is_marian = True
+            elif choice == "3":
+                model_name = "facebook/m2m100_1.2B"
+                is_marian = False
+
+            elif choice == "4" and opus_option:
+                model_name = "Helsinki-NLP/opus-mt-tc-big-en-pt"
+                is_marian = True
 
             print(f"\n🔁 Loading model: {model_name}")
 
