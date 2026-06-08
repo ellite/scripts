@@ -268,9 +268,11 @@ def choose_audio_bitrate(mode):
 
 def sanitize_filename(original_name, scaled, audio_mode, video_codec):
     name = original_name
-    
+
     # Video Codec handling
-    if video_codec == "x264":
+    if video_codec == "copy":
+        pass  # Audio-only re-encode: leave video codec tag untouched
+    elif video_codec == "x264":
         name = re.sub(r'(h\.?264|x264)', 'x264', name, flags=re.IGNORECASE)
         name = re.sub(r'(h\.?265|x265)', 'x264', name, flags=re.IGNORECASE)
     else:
@@ -704,6 +706,189 @@ def process_encoding(file, scale, audio_mode, audio_bitrate, gpu, encoding_mode,
         except OSError as e:
             print(f"⚠️ Error deleting {file}: {e}")
 
+def choose_operation():
+    print("\nWhat would you like to do?")
+    print("1) Re-encode video (H.265/H.264) [default]")
+    print("2) Re-encode audio only")
+    print("3) Fix timestamps only (copy pass)")
+    choice = input("Enter choice [1-3]: ").strip()
+    if choice == "2":
+        return "audio_only"
+    if choice == "3":
+        return "timestamp_fix"
+    return "video"
+
+def choose_audio_reencoding_mode():
+    print("\nTarget audio format:")
+    print("1) AAC 2.0 (Stereo) [default]")
+    print("2) AAC 5.1 (Surround)")
+    choice = input("Enter choice [1-2]: ").strip()
+    if choice == "2":
+        return "aac_5.1"
+    return "aac_2.0"
+
+def build_audio_only_command(input_file, audio_mode, audio_bitrate):
+    path = Path(input_file)
+    new_stem = sanitize_filename(path.stem, None, audio_mode, "copy")
+    final_out_file = f"{new_stem}.mkv"
+    tmp_file = f"{new_stem}.tmp.mkv"
+
+    try:
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=channels", "-of", "csv=p=0", input_file
+        ], capture_output=True, text=True)
+        input_channels = int(probe.stdout.strip())
+    except Exception:
+        input_channels = 2
+
+    audio_args = ["-c:a", "copy"]
+
+    if audio_mode == "aac_5.1":
+        if input_channels >= 6:
+            if should_convert_audio(input_file, 6):
+                audio_args = ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "6"]
+        else:
+            print(f"⚠️  Notice: {path.name} is Stereo. Creating Stereo output instead of 5.1.")
+            if should_convert_audio(input_file, 2):
+                audio_args = ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+    elif audio_mode == "aac_2.0":
+        if should_convert_audio(input_file, 2):
+            audio_args = ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
+
+    subtitle_codecs = get_subtitle_codecs(input_file)
+    subtitle_args = ["-map", "0:V", "-map", "0:a:0", "-map", "0:s?"]
+    text_codecs = {"ass", "ssa", "subrip", "srt", "text", "mov_text"}
+    for out_idx, (in_idx, codec) in enumerate(subtitle_codecs):
+        if codec.lower() in text_codecs:
+            subtitle_args += [f"-c:s:{out_idx}", "srt"]
+        else:
+            subtitle_args += [f"-c:s:{out_idx}", "copy"]
+
+    cmd = [
+        "ffmpeg",
+        "-i", input_file,
+        *subtitle_args,
+        "-c:v", "copy",
+        *audio_args,
+        tmp_file
+    ]
+    return cmd, final_out_file
+
+def process_audio_only_encoding(file, audio_mode, audio_bitrate, delete_originals):
+    global processes, encode_info
+
+    if stop_requested:
+        print(f"⏭️ Skipping: {file} (interrupted)")
+        return
+
+    print(f"\n▶️ Re-encoding audio: {file}")
+
+    cmd, final_out_file = build_audio_only_command(file, audio_mode, audio_bitrate)
+    tmp_file = cmd[-1]
+
+    time.sleep(1)
+
+    try:
+        process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+        processes[file] = process
+        encode_info[file] = {'start_time': time.time()}
+
+        monitor_thread = threading.Thread(
+            target=monitor_encoding_progress,
+            args=(file, process, "CPU")
+        )
+        monitor_thread.daemon = True
+        monitor_thread.start()
+
+        process.wait()
+        monitor_thread.join(timeout=0.1)
+
+        del processes[file]
+        del encode_info[file]
+
+    except Exception as e:
+        print(f"\n⚠️ Encoding of {file} failed: {e}")
+        if process:
+            process.terminate()
+        return
+
+    if process.returncode != 0:
+        print(f"❌ ffmpeg exited with code {process.returncode}.")
+        if Path(tmp_file).exists():
+            Path(tmp_file).unlink()
+        return
+
+    rename_external_subtitles(file, final_out_file)
+
+    print(f"🔧 Fixing timestamps: {tmp_file}")
+    fix_cmd = [
+        "ffmpeg", "-loglevel", "error",
+        "-i", tmp_file,
+        "-map", "0",
+        "-c", "copy",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        final_out_file
+    ]
+    fix_proc = subprocess.run(fix_cmd)
+
+    if fix_proc.returncode == 0 and Path(final_out_file).exists() and Path(final_out_file).stat().st_size > 5000:
+        Path(tmp_file).unlink()
+        print(f"✔ Done: {final_out_file}")
+    else:
+        print(f"⚠️ Timestamp fix failed, keeping encode without fix.")
+        if Path(final_out_file).exists():
+            Path(final_out_file).unlink()
+        os.replace(tmp_file, final_out_file)
+
+    if delete_originals and Path(file).resolve() != Path(final_out_file).resolve():
+        print(f"🗑️ Deleting original: {file}")
+        try:
+            os.remove(file)
+        except OSError as e:
+            print(f"⚠️ Error deleting {file}: {e}")
+
+
+def process_timestamp_fix(file, delete_originals):
+    if stop_requested:
+        print(f"⏭️ Skipping: {file} (interrupted)")
+        return
+
+    path = Path(file)
+    fixed_file = str(path.with_suffix(".fixed.mkv"))
+
+    print(f"\n🔧 Fixing timestamps: {file}")
+
+    fix_cmd = [
+        "ffmpeg", "-loglevel", "error",
+        "-i", file,
+        "-map", "0",
+        "-c", "copy",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        fixed_file
+    ]
+
+    fix_proc = subprocess.run(fix_cmd)
+
+    if fix_proc.returncode == 0 and Path(fixed_file).exists() and Path(fixed_file).stat().st_size > 5000:
+        out_file = str(path.with_suffix(".mkv"))
+        os.replace(fixed_file, out_file)
+        print(f"✔ Timestamp repair complete: {out_file}")
+
+        if delete_originals and Path(file).resolve() != Path(out_file).resolve():
+            print(f"🗑️ Deleting original: {file}")
+            try:
+                os.remove(file)
+            except OSError as e:
+                print(f"⚠️ Error deleting {file}: {e}")
+    else:
+        print(f"⚠️ Timestamp fix failed, original kept.")
+        if Path(fixed_file).exists():
+            Path(fixed_file).unlink()
+
+
 def main():
     """
     Main entry point.
@@ -719,10 +904,36 @@ def main():
 
     # User configuration prompts
     selected_files = get_user_selection(files)
+    operation = choose_operation()
+
+    # --- Timestamp-fix only path ---
+    if operation == "timestamp_fix":
+        delete_originals = yes_no("Delete original files after fixing?", default="no")
+        for file in selected_files:
+            if stop_requested:
+                print("🛑 Stopped by user.")
+                break
+            process_timestamp_fix(file, delete_originals)
+        return
+
+    # --- Audio-only re-encode path ---
+    if operation == "audio_only":
+        audio_mode = choose_audio_reencoding_mode()
+        audio_bitrate = choose_audio_bitrate(audio_mode)
+        delete_originals = yes_no("Delete original files after encoding?", default="no")
+
+        for file in selected_files:
+            if stop_requested:
+                print("🛑 Stopped by user.")
+                break
+            process_audio_only_encoding(file, audio_mode, audio_bitrate, delete_originals)
+        return
+
+    # --- Video re-encode path ---
     scale = choose_scale()
-    
+
     audio_mode = choose_audio_mode()
-    audio_bitrate = "128k" # Default
+    audio_bitrate = "128k"  # Default
     if audio_mode != "copy":
         audio_bitrate = choose_audio_bitrate(audio_mode)
 
