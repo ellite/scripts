@@ -59,6 +59,19 @@ VIDEO_EXTENSIONS = [
     ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".flv", ".wmv", ".webm", ".ts"
 ]
 
+
+def human_readable_size(num, suffix='B'):
+    """Return human readable file size (e.g. 1.2G)."""
+    try:
+        num = float(num)
+    except Exception:
+        return "N/A"
+    for unit in ['', 'K', 'M', 'G', 'T', 'P', 'E', 'Z']:
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}Y{suffix}"
+
 # Global state trackers
 stop_requested = False              # Flag for graceful shutdown
 processes = {}                      # Active ffmpeg Popen objects
@@ -94,7 +107,11 @@ def handle_sigint(signum, frame):
 # Register the handler
 signal.signal(signal.SIGINT, handle_sigint)
 
-def should_convert_audio(input_file):
+def should_convert_audio(input_file, target_channels):
+    """
+    Checks if the file is already AAC with the specific target channel count.
+    Returns True if conversion is needed, False if we can just copy.
+    """
     try:
         result = subprocess.run([
             "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
@@ -102,11 +119,15 @@ def should_convert_audio(input_file):
         ], capture_output=True, text=True)
 
         data = json.loads(result.stdout)
-        stream = data.get("streams", [{}])[0]
+        if not data.get("streams"):
+            return True # No audio stream found, let ffmpeg handle/fail it logic later
+            
+        stream = data["streams"][0]
         codec = stream.get("codec_name", "").lower()
         channels = stream.get("channels", 0)
 
-        return not (codec == "aac" and channels == 2)
+        # If it's already aac and matches target channels, no need to convert
+        return not (codec == "aac" and channels == target_channels)
 
     except Exception as e:
         print(f"⚠️ Could not determine audio stream info for {input_file}: {e}")
@@ -115,7 +136,12 @@ def should_convert_audio(input_file):
 def list_media_files(directory):
     files = [f for f in sorted(os.listdir(directory)) if Path(f).suffix.lower() in VIDEO_EXTENSIONS]
     for idx, file in enumerate(files):
-        print(f"{idx + 1}. {file}")
+        try:
+            size = (Path(directory) / file).stat().st_size
+            size_str = human_readable_size(size)
+        except Exception:
+            size_str = "N/A"
+        print(f"{idx + 1}. {file} ({size_str})")
     return files
 
 def get_user_selection(files):
@@ -166,14 +192,43 @@ def choose_gpu(multi=False):
 def choose_encoding_mode():
     print("\nChoose encoding mode:")
     print("1) Auto-quality (QP 24) [default]")
-    print("2) Fixed bitrate (1M, slow preset)")
-    print("3) Fixed bitrate (2M, slow preset)")
+    print("2) Higher quality (QP 22)")
+    print("3) Fixed bitrate (1M, slow preset)")
+    print("4) Fixed bitrate (2M, slow preset)")
     choice = input("Enter choice: ").strip()
     if choice == "2":
-        return "bitrate_1M"
+        return "qp22"
     elif choice == "3":
+        return "bitrate_1M"
+    elif choice == "4":
         return "bitrate_2M"
     return "qp"
+
+def choose_scale():
+    print("\nScale:")
+    print("1) Keep original (default)")
+    print("2) Scale to 720p")
+    print("3) Scale to 1080p")
+    c = input("Choice [1]: ").strip()
+    if c == "2":
+        return "720p"
+    if c == "3":
+        return "1080p"
+    return None
+
+def choose_audio_mode():
+    print("\nAudio Mode:")
+    print("1) Keep original (Copy) [default]")
+    print("2) Convert to AAC 2.0 (Stereo)")
+    print("3) Convert to AAC 5.1 (Surround)")
+    choice = input("Enter choice [1-3]: ").strip()
+    
+    if choice == "2":
+        return "aac_2.0"
+    elif choice == "3":
+        return "aac_5.1"
+    
+    return "copy"    
 
 def choose_codec():
     print("\nChoose video codec:")
@@ -184,36 +239,66 @@ def choose_codec():
         return "x264"
     return "x265"    
 
-def choose_audio_bitrate():
+def choose_audio_bitrate(mode):
     print("\nChoose audio bitrate:")
-    print("1) 128 kbps (default)")
-    print("2) 160 kbps")
-    print("3) 256 kbps")
-    choice = input("Enter choice [1-3]: ").strip()
+    
+    # Context menu for 5.1 Surround
+    if mode == "aac_5.1":
+        print("1) 384 kbps (Default)")
+        print("2) 256 kbps (Small file size)")
+        print("3) 448 kbps (High quality)")
+        print("4) 640 kbps (Maximum quality)")
+        
+        choice = input("Enter choice [1-4]: ").strip()
+        if choice == "2": return "256k"
+        if choice == "3": return "448k"
+        if choice == "4": return "640k"
+        return "384k" # Default
 
-    if choice == "2":
-        return "160k"
-    elif choice == "3":
-        return "256k"
+    # Context menu for 2.0 Stereo (or others)
     else:
-        return "128k"
+        print("1) 128 kbps (Default)")
+        print("2) 192 kbps (High Quality)")
+        print("3) 96 kbps (Small file size)")
+        
+        choice = input("Enter choice [1-3]: ").strip()
+        if choice == "2": return "192k"
+        if choice == "3": return "96k"
+        return "128k" # Default
 
-def sanitize_filename(original_name, scaled, audio_converted, video_codec):
+def sanitize_filename(original_name, scaled, audio_mode, video_codec):
     name = original_name
+    
+    # Video Codec handling
     if video_codec == "x264":
         name = re.sub(r'(h\.?264|x264)', 'x264', name, flags=re.IGNORECASE)
         name = re.sub(r'(h\.?265|x265)', 'x264', name, flags=re.IGNORECASE)
     else:
         name = re.sub(r'(h\.?264|x264)', 'x265', name, flags=re.IGNORECASE)
-    if scaled:
-        name = re.sub(r'(1080p|576p|480p)', '720p', name, flags=re.IGNORECASE)
+
+    # Resolution handling
+    if scaled == "720p":
+        name = re.sub(r'(4K|UHD|1080p|576p|480p|720p)', '720p', name, flags=re.IGNORECASE)
         if not re.search(r'720p', name, re.IGNORECASE):
             name += ".720p"
-    if audio_converted:
+    elif scaled == "1080p":
+        name = re.sub(r'(1080p|576p|480p|720p)', '1080p', name, flags=re.IGNORECASE)
+        if not re.search(r'1080p', name, re.IGNORECASE):
+            name += ".1080p"
+
+    # Audio handling
+    if audio_mode != "copy":
+        # Remove old audio tags
         name = re.sub(r'\b(dts|ac3|eac3|ddp|ddplus|mp3|ogg|flac|opus)\b', 'AAC', name, flags=re.IGNORECASE)
-        name = re.sub(r'\b(aac|ddp|dd\+|ddplus)[\s_.-]*5[\s_.-]*1\b', 'AAC2.0', name, flags=re.IGNORECASE)
-        name = re.sub(r'\b5[\s_.-]*1\b', '2.0', name, flags=re.IGNORECASE)
-        name = re.sub(r'\b(atmos)\b', 'AAC', name, flags=re.IGNORECASE)
+        name = re.sub(r'\b(atmos)\b', '', name, flags=re.IGNORECASE)
+        
+        if audio_mode == "aac_2.0":
+            name = re.sub(r'\b(aac|ddp|dd\+|ddplus)[\s_.-]*5[\s_.-]*1\b', 'AAC2.0', name, flags=re.IGNORECASE)
+            name = re.sub(r'\b5[\s_.-]*1\b', '2.0', name, flags=re.IGNORECASE)
+        elif audio_mode == "aac_5.1":
+            name = re.sub(r'\b(aac|ddp|dd\+|ddplus)[\s_.-]*2[\s_.-]*0\b', 'AAC5.1', name, flags=re.IGNORECASE)
+            name = re.sub(r'\b2[\s_.-]*0\b', '5.1', name, flags=re.IGNORECASE)
+
     return name
 
 def rename_external_subtitles(original_file, new_file):
@@ -255,14 +340,14 @@ def detect_video_codec(input_file):
         print(f"⚠️ Could not detect codec for {input_file}: {e}")
         return ""  
 
-def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, video_codec="x265"):
+def build_ffmpeg_command(input_file, scale, audio_mode, audio_bitrate, gpu, encoding_mode, video_codec="x265"):
     """
     Build the ffmpeg command dynamically for either NVIDIA (NVENC) or Intel (VAAPI).
     Automatically detects input codec for correct hardware decode.
     """
 
     path = Path(input_file)
-    new_stem = sanitize_filename(path.stem, scale, convert_audio, video_codec)
+    new_stem = sanitize_filename(path.stem, scale, audio_mode, video_codec)
     out_file = f"{new_stem}.mkv"
 
     # Prevent accidental overwrite of input
@@ -279,10 +364,33 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
     # ----------------------------
     # Audio & subtitle setup
     # ----------------------------
-    if convert_audio and should_convert_audio(input_file):
-        audio_args = ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
-    else:
-        audio_args = ["-c:a", "copy"]
+
+    try:
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0", 
+            "-show_entries", "stream=channels", "-of", "csv=p=0", input_file
+        ], capture_output=True, text=True)
+        input_channels = int(probe.stdout.strip())
+    except:
+        input_channels = 2 # Assume stereo if probe fails to be safe
+
+    audio_args = ["-c:a", "copy"] # Default to copy
+
+    if audio_mode == "aac_5.1":
+        if input_channels >= 6:
+            if should_convert_audio(input_file, 6):
+                audio_args = ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "6"]
+        else:
+            # Source is Stereo -> FALLBACK to Stereo (Don't upmix!)
+            print(f"⚠️  Notice: {Path(input_file).name} is Stereo. Creating Stereo output instead of 5.1.")
+            if should_convert_audio(input_file, 2):
+                # Use a standard stereo bitrate (128k) instead of the 5.1 bitrate
+                audio_args = ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+
+    elif audio_mode == "aac_2.0":
+        # Downmixing (5.1 -> 2.0) is always okay
+        if should_convert_audio(input_file, 2):
+            audio_args = ["-c:a", "aac", "-b:a", audio_bitrate, "-ac", "2"]
 
     subtitle_codecs = get_subtitle_codecs(input_file)
     subtitle_args = ["-map", "0:V", "-map", "0:a:0", "-map", "0:s?"]
@@ -298,8 +406,6 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
     # NVIDIA path (NVENC + CUVID)
     # ----------------------------
     if gpu["type"] == "nvidia":
-        hwaccel_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-
         # Detect source codec and use matching CUDA decoder if possible
         input_codec = detect_video_codec(input_file)
         cuda_decoders = {
@@ -310,7 +416,27 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             "av1": "av1_cuvid"
         }
         decode_codec = cuda_decoders.get(input_codec)
-        decode_args = ["-c:v", decode_codec] if decode_codec else []
+
+        if decode_codec:
+            # Full HW path: CUDA decode → scale_cuda → NVENC
+            hwaccel_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            decode_args = ["-c:v", decode_codec]
+            if scale == "720p":
+                vf_filter = "scale_cuda=w=1280:h=-2"
+            elif scale == "1080p":
+                vf_filter = "scale_cuda=w=1920:h=-2"
+            else:
+                vf_filter = None
+        else:
+            # No CUDA decoder for this codec (e.g. mpeg4/xvid); software decode → NVENC
+            hwaccel_args = []
+            decode_args = []
+            if scale == "720p":
+                vf_filter = "scale=w=1280:h=-2"
+            elif scale == "1080p":
+                vf_filter = "scale=w=1920:h=-2"
+            else:
+                vf_filter = None
 
         # Encoder selection
         if video_codec == "x264":
@@ -321,6 +447,8 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
         # Quality / bitrate
         if encoding_mode == "qp":
             video_args += ["-rc", "constqp", "-qp", "24", "-preset", "medium"]
+        elif encoding_mode == "qp22":
+            video_args += ["-rc", "constqp", "-qp", "22", "-preset", "medium"]
         elif encoding_mode == "bitrate_1M":
             video_args += ["-b:v", "1M", "-maxrate", "2M", "-preset", "slow"]
         elif encoding_mode == "bitrate_2M":
@@ -328,12 +456,6 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
         else:
             print(f"❌ Unknown encoding mode: {encoding_mode}. Defaulting to auto-quality (QP 24).")
             video_args += ["-rc", "constqp", "-qp", "24", "-preset", "medium"]
-
-        # Filter chain (CUDA)
-        if scale:
-            vf_filter = "scale_cuda=w=1280:h=-2"
-        else:
-            vf_filter = "scale_cuda=w=iw:h=ih"
 
         # Final command for NVIDIA
         cmd = [
@@ -361,6 +483,8 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
 
         if encoding_mode == "qp":
             video_args += ["-qp", "24"]
+        elif encoding_mode == "qp22":
+            video_args += ["-qp", "22"]
         elif encoding_mode == "bitrate_1M":
             video_args += ["-b:v", "1M", "-preset", "slow"]
         elif encoding_mode == "bitrate_2M":
@@ -369,7 +493,12 @@ def build_ffmpeg_command(input_file, scale, convert_audio, audio_bitrate, gpu, e
             print(f"❌ Unknown encoding mode: {encoding_mode}. Defaulting to auto-quality (QP 24).")
             video_args += ["-qp", "24"]
 
-        vf_filter = "scale=w=1280:-2,format=nv12,hwupload" if scale else "format=nv12,hwupload"
+        if scale == "720p":
+            vf_filter = "scale=w=1280:-2,format=nv12,hwupload"
+        elif scale == "1080p":
+            vf_filter = "scale=w=1920:-2,format=nv12,hwupload"
+        else:
+            vf_filter = "format=nv12,hwupload"
 
         cmd = [
             "ffmpeg",
@@ -475,16 +604,7 @@ def monitor_encoding_progress(file, process, gpu_label):
             print(f"\n🔍 FFmpeg Error Output for {file}:\n" + "\n".join(stderr_lines))
             time.sleep(1)  # Give time to read the error
 
-def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, delete_originals, video_codec="x265"):
-    """
-    Handles a single encoding job:
-      - Builds the ffmpeg command for the selected GPU (NVENC or VAAPI)
-      - Starts the encoding process and monitors progress
-      - Cleans up when finished
-    """
-
-    global processes, encode_info
-def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, delete_originals, video_codec="x265"):
+def process_encoding(file, scale, audio_mode, audio_bitrate, gpu, encoding_mode, delete_originals, video_codec="x265"):
     """
     Handles a single encoding job:
       - Builds the ffmpeg command
@@ -503,7 +623,7 @@ def process_encoding(file, scale, convert_audio, audio_bitrate, gpu, encoding_mo
     print(f"\n▶️ Encoding: {file} using {gpu_label}")
 
     # Build ffmpeg command
-    cmd = build_ffmpeg_command(file, scale, convert_audio, audio_bitrate, gpu, encoding_mode, video_codec)
+    cmd = build_ffmpeg_command(file, scale, audio_mode, audio_bitrate, gpu, encoding_mode, video_codec)
     out_file = cmd[-1]
 
     time.sleep(3)
@@ -599,11 +719,12 @@ def main():
 
     # User configuration prompts
     selected_files = get_user_selection(files)
-    scale = yes_no("Scale video to 720p?", default="no")
-    convert_audio = yes_no("Convert audio to AAC 2.0?", default="no")
-    audio_bitrate = None
-    if convert_audio:
-        audio_bitrate = choose_audio_bitrate()
+    scale = choose_scale()
+    
+    audio_mode = choose_audio_mode()
+    audio_bitrate = "128k" # Default
+    if audio_mode != "copy":
+        audio_bitrate = choose_audio_bitrate(audio_mode)
 
     video_codec = choose_codec()
     encoding_mode = choose_encoding_mode()
@@ -628,7 +749,7 @@ def main():
                 process_encoding(
                     file,
                     scale,
-                    convert_audio,
+                    audio_mode,
                     audio_bitrate,
                     gpu,
                     encoding_mode,
@@ -655,7 +776,7 @@ def main():
             process_encoding(
                 file,
                 scale,
-                convert_audio,
+                audio_mode,
                 audio_bitrate,
                 gpu_devices[0],
                 encoding_mode,
